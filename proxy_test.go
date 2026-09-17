@@ -207,20 +207,31 @@ func origin(t *testing.T) string {
 	return ln.Addr().String()
 }
 
-func mustNew(t *testing.T, pools ...*Pool) *Proxy {
+// exit compiles one gate for a live upstream, failing the test rather than the
+// dial if the template is wrong.
+func exit(t *testing.T, g Gate) Exit {
 	t.Helper()
-	x, err := New(pools...)
+	e, err := g.Exit()
 	if err != nil {
 		t.Fatal(err)
 	}
-	// These tests dial an origin they started on loopback, which the default
-	// fence refuses and is right to. TestFence covers the fence itself.
-	x.Reach = Anywhere
-	return x
+	return e
 }
 
-// Both transports must carry a Need out to the provider and return a tunnel
-// that actually reaches the origin.
+// open is the composition these tests use: a real route with the fence lifted,
+// because they dial an origin they started on loopback. TestFence covers the
+// fence itself. Naming it here is the point — nothing implicitly turns it off.
+func open(t *testing.T, gs ...Gate) Exit {
+	t.Helper()
+	es := make([]Exit, len(gs))
+	for i, g := range gs {
+		es[i] = exit(t, g)
+	}
+	return Chain(Fence(Anywhere))(Try(Fixed, es...))
+}
+
+// Both transports must carry a Need out to the vendor and return a tunnel that
+// actually reaches the origin.
 func TestDialBothSchemes(t *testing.T) {
 	site := origin(t)
 	for _, socks := range []bool{false, true} {
@@ -230,15 +241,13 @@ func TestDialBothSchemes(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			up := serveUp(t, socks)
-			x := mustNew(t, &Pool{
-				Label: "vendor",
-				Addr:  up.addr(),
-				User:  `acct{{with .Country}}-country-{{.}}{{end}}{{with .Session}}-sid-{{.}}{{end}}`,
-				Pass:  "secret",
+			e := open(t, Gate{
+				Name: "vendor", Addr: up.addr(), Pass: "secret",
+				User: `acct{{with .Country}}-country-{{.}}{{end}}{{with .Session}}-sid-{{.}}{{end}}`,
 			})
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			c, err := x.Dial(ctx, Need{Country: "de", Session: "cart42"}, site)
+			c, err := e(ctx, Need{Country: "de", Session: "cart42"}, site)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -253,117 +262,49 @@ func TestDialBothSchemes(t *testing.T) {
 				t.Fatalf("tunnel did not reach the origin: %q", body)
 			}
 			if got := up.seen(); len(got) != 1 || got[0] != "acct-country-de-sid-cart42" {
-				t.Fatalf("provider saw %q, want the need rendered into the username", got)
+				t.Fatalf("vendor saw %q, want the need rendered into the username", got)
 			}
 		})
 	}
 }
 
-// A field the caller left empty must take its whole segment with it: providers
-// read a bare "country-" as an error, not as a wildcard.
+// A field the caller left empty takes its whole segment with it: vendors read a
+// bare "country-" as an error, not as a wildcard.
 func TestEmptyFieldDropsItsSegment(t *testing.T) {
 	site := origin(t)
 	up := serveUp(t, false)
-	x := mustNew(t, &Pool{
-		Label: "vendor", Addr: up.addr(),
-		User: `acct{{with .Country}}-country-{{.}}{{end}}{{with .Session}}-sid-{{.}}{{end}}`,
-	})
-	c, err := x.Dial(context.Background(), Need{}, site)
+	e := open(t, Gate{Name: "vendor", Addr: up.addr(),
+		User: `acct{{with .Country}}-country-{{.}}{{end}}{{with .Session}}-sid-{{.}}{{end}}`})
+	c, err := e(context.Background(), Need{}, site)
 	if err != nil {
 		t.Fatal(err)
 	}
 	c.Close()
 	if got := up.seen(); len(got) != 1 || got[0] != "acct" {
-		t.Fatalf("provider saw %q, want bare %q", got, "acct")
+		t.Fatalf("vendor saw %q, want bare %q", got, "acct")
 	}
 }
 
-// A need nothing serves is a gap in the table, and must be distinguishable
-// from a bad minute so an operator knows to fix config rather than retry.
-func TestNoExitIsItsOwnError(t *testing.T) {
-	x := mustNew(t, &Pool{Label: "dc-only", Addr: "http://127.0.0.1:1", Kinds: []Kind{Datacenter}})
-	_, err := x.Dial(context.Background(), Need{Kind: Mobile}, "example.com:443")
-	if !errors.Is(err, ErrNoExit) {
+// Capability is a rule, and a need nothing serves is a gap in the table —
+// distinguishable from a bad minute so an operator knows which to fix.
+func TestOnlyRefusesWhatItCannotServe(t *testing.T) {
+	up := serveUp(t, false)
+	dc := Only(In(nil, []Kind{Datacenter}))(exit(t, Gate{Name: "dc", Addr: up.addr()}))
+	if _, err := dc(context.Background(), Need{Kind: Mobile}, "example.com:443"); !errors.Is(err, ErrNoExit) {
+		t.Fatalf("got %v, want ErrNoExit", err)
+	}
+	if len(up.seen()) != 0 {
+		t.Fatal("an unservable need still reached the vendor")
+	}
+	// And Try over nothing servable says the same thing.
+	none := Try(Fixed)
+	if _, err := none(context.Background(), Need{}, "example.com:443"); !errors.Is(err, ErrNoExit) {
 		t.Fatalf("got %v, want ErrNoExit", err)
 	}
 }
 
-// One vendor being down must not fail a request another vendor can serve: the
-// caller asked for a property of the exit, not for a company.
-func TestFailoverAcrossVendors(t *testing.T) {
-	site := origin(t)
-	good := serveUp(t, false)
-	x := mustNew(t,
-		&Pool{Label: "down", Addr: "http://127.0.0.1:1", User: "a"},
-		&Pool{Label: "up", Addr: good.addr(), User: "b"},
-	)
-	c, err := x.Dial(context.Background(), Need{}, site)
-	if err != nil {
-		t.Fatal(err)
-	}
-	c.Close()
-	if len(good.seen()) != 1 {
-		t.Fatal("the working vendor was never tried")
-	}
-	// And the dead one must now sort last, so the next call does not pay for
-	// its timeout again.
-	if x.order(Need{})[0].Label != "up" {
-		t.Fatal("a failing vendor stayed first in line")
-	}
-}
-
-// An upstream that refuses the credential is a failure, not a tunnel. Getting
-// this wrong hands the caller a socket that reads EOF and looks like the site.
-func TestRefusedCredentialIsAnError(t *testing.T) {
-	for _, socks := range []bool{false, true} {
-		up := serveUp(t, socks)
-		up.deny = true
-		x := mustNew(t, &Pool{Label: "v", Addr: up.addr(), User: "a", Pass: "wrong"})
-		if _, err := x.Dial(context.Background(), Need{}, "example.com:443"); err == nil {
-			t.Fatalf("socks=%v: a refused credential returned a usable tunnel", socks)
-		}
-	}
-}
-
-// A sticky session must keep landing on the same vendor. Rotating it would
-// hand the caller a different address mid-flow, which is the one thing the
-// session was asked for.
-func TestSessionPinsToOneVendor(t *testing.T) {
-	x := mustNew(t,
-		&Pool{Label: "a", Addr: "http://127.0.0.1:1"},
-		&Pool{Label: "b", Addr: "http://127.0.0.1:2"},
-		&Pool{Label: "c", Addr: "http://127.0.0.1:3"},
-	)
-	first := x.order(Need{Session: "cart42"})[0].Label
-	for i := 0; i < 50; i++ {
-		if got := x.order(Need{Session: "cart42"})[0].Label; got != first {
-			t.Fatalf("session moved vendor: %s then %s", first, got)
-		}
-	}
-	// Health must not override it either — that is what "sticky" means.
-	for _, p := range x.pools {
-		if p.Label == first {
-			p.fails.Store(99)
-		}
-	}
-	if got := x.order(Need{Session: "cart42"})[0].Label; got != first {
-		t.Fatalf("a failure count moved a pinned session from %s to %s", first, got)
-	}
-}
-
-// A bad template must fail at load. Deferring it to the first dial turns a
-// config typo into an outage under traffic.
-func TestBadTemplateFailsAtLoad(t *testing.T) {
-	if _, err := New(&Pool{Label: "v", Addr: "http://x:1", User: "{{.Nope"}); err == nil {
-		t.Fatal("a malformed username template loaded clean")
-	}
-	if _, err := New(&Pool{Label: "v"}); err == nil {
-		t.Fatal("a pool with no address loaded clean")
-	}
-}
-
-func TestServes(t *testing.T) {
-	p := &Pool{Kinds: []Kind{Residential, Mobile}, Countries: []string{"de", "fr"}}
+func TestIn(t *testing.T) {
+	can := In([]string{"de", "fr"}, []Kind{Residential, Mobile})
 	for _, c := range []struct {
 		n    Need
 		want bool
@@ -374,12 +315,54 @@ func TestServes(t *testing.T) {
 		{Need{Kind: Datacenter}, false},
 		{Need{Kind: Any, Country: "fr"}, true},
 	} {
-		if got := p.Serves(c.n); got != c.want {
-			t.Errorf("Serves(%+v) = %v, want %v", c.n, got, c.want)
+		if got := can(c.n); got != c.want {
+			t.Errorf("In(%+v) = %v, want %v", c.n, got, c.want)
 		}
 	}
-	// An unconstrained pool serves everything.
-	if !(&Pool{}).Serves(Need{Country: "jp", Kind: Mobile}) {
-		t.Error("an unconstrained pool refused a need")
+	if !In(nil, nil)(Need{Country: "jp", Kind: Mobile}) {
+		t.Error("an unconstrained predicate refused a need")
+	}
+}
+
+// One vendor being down must not fail a request another can serve: the caller
+// asked for a property of the exit, not for a company.
+func TestFailoverAcrossVendors(t *testing.T) {
+	site := origin(t)
+	good := serveUp(t, false)
+	e := open(t,
+		Gate{Name: "down", Addr: "http://127.0.0.1:1", User: "a"},
+		Gate{Name: "up", Addr: good.addr(), User: "b"},
+	)
+	c, err := e(context.Background(), Need{}, site)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Close()
+	if len(good.seen()) != 1 {
+		t.Fatal("the working vendor was never tried")
+	}
+}
+
+// An upstream that refuses the credential is a failure, not a tunnel. Getting
+// this wrong hands the caller a socket that reads EOF and looks like the site.
+func TestRefusedCredentialIsAnError(t *testing.T) {
+	for _, socks := range []bool{false, true} {
+		up := serveUp(t, socks)
+		up.deny = true
+		e := open(t, Gate{Name: "v", Addr: up.addr(), User: "a", Pass: "wrong"})
+		if _, err := e(context.Background(), Need{}, "example.com:443"); err == nil {
+			t.Fatalf("socks=%v: a refused credential returned a usable tunnel", socks)
+		}
+	}
+}
+
+// A bad template fails at load. Deferring it to the first dial turns a config
+// typo into an outage under traffic.
+func TestBadGateFailsAtLoad(t *testing.T) {
+	if _, err := (Gate{Name: "v", Addr: "http://x:1", User: "{{.Nope"}).Exit(); err == nil {
+		t.Fatal("a malformed username template compiled clean")
+	}
+	if _, err := (Gate{Name: "v"}).Exit(); err == nil {
+		t.Fatal("a gate with no address compiled clean")
 	}
 }

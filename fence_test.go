@@ -67,15 +67,12 @@ func TestFence(t *testing.T) {
 	}
 }
 
-// A fenced target must be refused BEFORE any upstream is dialled — the point is
-// that the request never leaves, not that it fails somewhere downstream.
+// A fenced target is refused BEFORE any upstream is dialled — the point is that
+// the request never leaves, not that it fails somewhere downstream.
 func TestFenceRefusesBeforeDialling(t *testing.T) {
 	up := serveUp(t, false)
-	x, err := New(&Pool{Label: "v", Addr: up.addr()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := x.Dial(context.Background(), Need{}, "169.254.169.254:80"); !errors.Is(err, ErrClosed) {
+	e := Fence(Public)(exit(t, Gate{Name: "v", Addr: up.addr()}))
+	if _, err := e(context.Background(), Need{}, "169.254.169.254:80"); !errors.Is(err, ErrClosed) {
 		t.Fatalf("got %v, want ErrClosed", err)
 	}
 	if len(up.seen()) != 0 {
@@ -83,56 +80,35 @@ func TestFenceRefusesBeforeDialling(t *testing.T) {
 	}
 }
 
-// The default is the fence. A Proxy nobody configured must not be open.
-func TestDefaultIsFenced(t *testing.T) {
-	x, err := New(&Pool{Label: "v", Addr: "http://127.0.0.1:1"})
-	if err != nil {
-		t.Fatal(err)
+// One fence wraps a whole route, so an exit added to the route later cannot
+// miss it. That is the reason it is a Rule and not a field on each exit.
+func TestFenceCoversEveryExitInTheRoute(t *testing.T) {
+	a, b := serveUp(t, false), serveUp(t, false)
+	route := Chain(Fence(Public))(Try(Fixed,
+		exit(t, Gate{Name: "a", Addr: a.addr()}),
+		exit(t, Gate{Name: "b", Addr: b.addr()}),
+	))
+	if _, err := route(context.Background(), Need{}, "10.0.0.144:6443"); !errors.Is(err, ErrClosed) {
+		t.Fatalf("got %v, want ErrClosed", err)
 	}
-	if x.Reach != nil {
-		t.Fatal("New set a Reach; nil must mean Public")
-	}
-	if _, err := x.Dial(context.Background(), Need{}, "10.0.0.144:6443"); !errors.Is(err, ErrClosed) {
-		t.Fatalf("an unconfigured Proxy dialled the cluster: %v", err)
+	if len(a.seen())+len(b.seen()) != 0 {
+		t.Fatal("a fenced target reached an exit inside the route")
 	}
 }
 
 // A conn does not watch a context, so cancellation during the handshake is
 // wired to closing the socket. Without that a cancelled caller waits out the
-// negotiation deadline instead of returning, which is the whole point of
-// having passed a context at all.
+// negotiation deadline instead of returning.
 func TestCancelDuringHandshake(t *testing.T) {
-	// Accepts, then says nothing — a stalled upstream, which is what makes the
-	// handshake block rather than fail.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	go func() {
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			defer c.Close()
-		}
-	}()
-
-	x, err := New(&Pool{Label: "stalled", Addr: "http://" + ln.Addr().String()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	x.Reach = Anywhere
-
+	ln := stalled(t)
+	e := Chain(Fence(Anywhere))(exit(t, Gate{Name: "stalled", Addr: "http://" + ln}))
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() { time.Sleep(50 * time.Millisecond); cancel() }()
 
 	start := time.Now()
-	if _, err := x.Dial(ctx, Need{}, "example.com:443"); !errors.Is(err, context.Canceled) {
+	if _, err := e(ctx, Need{}, "example.com:443"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("got %v, want context.Canceled", err)
 	}
-	// Promptly, not after the 30s negotiation deadline.
 	if d := time.Since(start); d > 5*time.Second {
 		t.Fatalf("cancellation took %v; the handshake was not watching the context", d)
 	}
@@ -140,30 +116,32 @@ func TestCancelDuringHandshake(t *testing.T) {
 
 // And a deadline is still honoured when the caller names one.
 func TestHandshakeDeadline(t *testing.T) {
+	ln := stalled(t)
+	e := Chain(Fence(Anywhere))(exit(t, Gate{Name: "stalled", Addr: "http://" + ln}))
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := e(ctx, Need{}, "example.com:443"); err == nil {
+		t.Fatal("a stalled handshake returned a usable tunnel")
+	}
+}
+
+// stalled accepts and then says nothing, which is what makes a handshake block
+// rather than fail.
+func stalled(t *testing.T) string {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	t.Cleanup(func() { ln.Close() })
 	go func() {
 		for {
 			c, err := ln.Accept()
 			if err != nil {
 				return
 			}
-			defer c.Close()
+			t.Cleanup(func() { c.Close() })
 		}
 	}()
-
-	x, err := New(&Pool{Label: "stalled", Addr: "http://" + ln.Addr().String()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	x.Reach = Anywhere
-
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-	if _, err := x.Dial(ctx, Need{}, "example.com:443"); err == nil {
-		t.Fatal("a stalled handshake returned a usable tunnel")
-	}
+	return ln.Addr().String()
 }

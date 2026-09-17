@@ -20,8 +20,8 @@ func front(t *testing.T, check func(context.Context, string) error) (*http.Clien
 	t.Helper()
 	up := serveUp(t, false)
 	s := &Server{
-		Proxy: mustNew(t, &Pool{
-			Label: "vendor", Addr: up.addr(), Pass: "secret",
+		Exit: open(t, Gate{
+			Name: "vendor", Addr: up.addr(), Pass: "secret",
 			User: `acct{{with .Country}}-c-{{.}}{{end}}{{with .Session}}-s-{{.}}{{end}}`,
 		}),
 		Check: check,
@@ -104,7 +104,7 @@ func TestDeniedTokenIsRefused(t *testing.T) {
 // middle of unencrypted requests carrying the caller's own credentials.
 func TestPlainGetIsRefused(t *testing.T) {
 	up := serveUp(t, false)
-	s := &Server{Proxy: mustNew(t, &Pool{Label: "v", Addr: up.addr()})}
+	s := &Server{Exit: open(t, Gate{Name: "v", Addr: up.addr()})}
 	w := httptest.NewRecorder()
 	s.ServeHTTP(w, httptest.NewRequest("GET", "http://example.com/", nil))
 	if w.Code != http.StatusMethodNotAllowed {
@@ -114,7 +114,8 @@ func TestPlainGetIsRefused(t *testing.T) {
 
 // A need nothing serves must not read as a transient upstream failure.
 func TestUnservableNeedIsNotABadGateway(t *testing.T) {
-	s := &Server{Proxy: mustNew(t, &Pool{Label: "dc", Addr: "http://127.0.0.1:1", Kinds: []Kind{Datacenter}})}
+	s := &Server{Exit: Only(In(nil, []Kind{Datacenter}))(
+		exit(t, Gate{Name: "dc", Addr: "http://127.0.0.1:1"}))}
 	// Authority-form, as net/http hands a real CONNECT to a handler.
 	r := httptest.NewRequest("CONNECT", "/", nil)
 	r.URL = &url.URL{Host: "example.com:443"}

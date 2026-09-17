@@ -11,20 +11,17 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"text/template"
 	"time"
 )
 
-// dial opens a tunnel to addr through this upstream.
-//
-// Both schemes below are dialled with the context's deadline and closed on any
-// error, because a half-negotiated tunnel is indistinguishable from a working
-// one until the first read and leaks a socket per failure either way.
-func (p *Pool) dial(ctx context.Context, n Need, addr string) (net.Conn, error) {
-	scheme, host, ok := strings.Cut(p.Addr, "://")
+// dial opens a tunnel to addr through this gate.
+func (g Gate) dial(ctx context.Context, t *template.Template, n Need, addr string) (net.Conn, error) {
+	scheme, host, ok := strings.Cut(g.Addr, "://")
 	if !ok {
-		scheme, host = "http", p.Addr
+		scheme, host = "http", g.Addr
 	}
-	user, err := p.name(n)
+	user, err := g.name(t, n)
 	if err != nil {
 		return nil, fmt.Errorf("username: %w", err)
 	}
@@ -35,10 +32,10 @@ func (p *Pool) dial(ctx context.Context, n Need, addr string) (net.Conn, error) 
 	}
 
 	// Negotiation is bounded two ways, because one is not enough. A DEADLINE
-	// stops a handshake that stalls, and the caller's is used when it named
-	// one. CANCELLATION is the other, and a net.Conn does not watch a context:
-	// the only thing that unblocks a blocked read is closing it, so that is
-	// what cancellation is wired to.
+	// stops a handshake that stalls, and the caller's is used when it named one.
+	// CANCELLATION is the other, and a net.Conn does not watch a context: the
+	// only thing that unblocks a blocked read is closing it, so that is what
+	// cancellation is wired to.
 	deadline, ok := ctx.Deadline()
 	if !ok {
 		deadline = time.Now().Add(negotiate)
@@ -48,17 +45,17 @@ func (p *Pool) dial(ctx context.Context, n Need, addr string) (net.Conn, error) 
 
 	switch scheme {
 	case "http", "https":
-		err = connect(c, addr, user, p.Pass)
+		err = connect(c, addr, user, g.Pass)
 	case "socks5", "socks5h":
-		err = socks(c, addr, user, p.Pass)
+		err = socks(c, addr, user, g.Pass)
 	default:
 		err = fmt.Errorf("unknown scheme %q", scheme)
 	}
 
 	// Unwire before the conn is handed back. A false return means cancellation
 	// already ran and this socket is closed or closing, so there is nothing to
-	// return but the reason — and reporting the handshake error instead would
-	// blame the upstream for our own caller going away.
+	// return but the reason — reporting the handshake error instead would blame
+	// the upstream for our own caller going away.
 	if !stop() {
 		c.Close()
 		return nil, context.Cause(ctx)
@@ -68,10 +65,9 @@ func (p *Pool) dial(ctx context.Context, n Need, addr string) (net.Conn, error) 
 		return nil, err
 	}
 	// Past here the conn belongs to the caller and not to ctx, which is exactly
-	// what net.Dialer.DialContext promises about the one it returns. The
-	// deadline goes with it: it covered NEGOTIATION, and leaving it on would
-	// cap the tunnel's whole life at the handshake timeout — for a long page
-	// fetch, a read error that looks like the site hung up.
+	// what net.Dialer.DialContext promises about the one it returns. The deadline
+	// goes with it: it covered NEGOTIATION, and leaving it on would cap the
+	// tunnel's whole life at the handshake timeout.
 	_ = c.SetDeadline(time.Time{})
 	return c, nil
 }

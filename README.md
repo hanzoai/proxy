@@ -7,16 +7,18 @@ Germany is to hand it a provider's credentials. That is the thing to avoid:
 credentials inside a sandbox are credentials you have published, and a workload
 that can open a socket can open any socket.
 
-So the sandbox gets no network. This is the network. A caller says what it
-needs of an exit and gets a connection. It never learns which provider served
-it, never holds a provider password, and cannot address anything but the host
-it asked for.
+So the sandbox gets no network. This is the network.
+
+## One type
 
 ```go
-c, err := p.Dial(ctx, proxy.Need{Country: "de", Kind: proxy.Residential}, "example.com:443")
+type Exit func(ctx context.Context, n Need, addr string) (net.Conn, error)
 ```
 
-## The ask
+A vendor, our own egress, a test double, and the composition of a dozen of them
+are all this. There is nothing to implement and nothing to register.
+
+A `Need` is what the caller requires of an exit:
 
 ```go
 type Need struct {
@@ -31,49 +33,86 @@ to arrive from the same address or the site sees two visitors and shows neither
 the content. Leave it empty and every request takes a fresh address, which is
 what breadth-first crawling wants.
 
-## Providers are a table, not a driver
-
-NodeMaven, ProxyEmpire, Bright Data, Oxylabs, Smartproxy and IPRoyal all
-present the same shape: one gateway address, and the routing rides in the
-*username*. They differ only in the words they spell it with. So a provider is
-a row:
+## Everything else is a function that returns one
 
 ```go
-proxy.New(
-	&proxy.Pool{
-		Label: "vendor-a",
-		Addr:  "http://gate.vendor-a.example:8000",
-		User:  `acct-4471{{with .Country}}-country-{{.}}{{end}}{{with .Session}}-sid-{{.}}{{end}}`,
-		Pass:  kms.Must("proxy/vendor-a"),
-		Kinds: []proxy.Kind{proxy.Residential, proxy.Mobile},
-	},
-	&proxy.Pool{
-		Label:     "vendor-b",
-		Addr:      "socks5://gate.vendor-b.example:1080",
-		User:      `user-9930{{with .Country}}-{{.}}{{end}}`,
-		Pass:      kms.Must("proxy/vendor-b"),
-		Countries: []string{"de", "fr", "nl"},
-	},
+type Rule  func(Exit) Exit             // fencing, capability
+type Order func(Need, []Exit) []Exit   // health, pinning
+```
+
+Capability, health, fencing and failover used to be fields on a struct and
+branches inside one Dial. They are independent, so they are separate:
+
+```go
+order, watch := proxy.Health()
+
+route := proxy.Chain(proxy.Fence(proxy.Public))(
+	proxy.Try(proxy.Then(order, proxy.Pin(seed)),
+		watch(mustExit(vendorA)),
+		watch(proxy.Only(proxy.In([]string{"de", "fr"}, nil))(mustExit(vendorB))),
+	),
 )
 ```
 
+Read outward: every exit is health-counted, one of them only serves DE and FR,
+the set is ordered by health and then pinned by session, and the whole route is
+fenced. Adding a vendor is one more line; adding a policy is one more `Rule`,
+and nothing it wraps has to know.
+
+`Then` runs orders in sequence and the last one wins first position, which is
+why a pin belongs after a health sort rather than before it.
+
+## Vendors are a table, not a driver
+
+NodeMaven, ProxyEmpire, Bright Data, Oxylabs, Smartproxy and IPRoyal all present
+one gateway address and carry the routing in the *username*, differing only in
+the words they spell it with. So a vendor is data:
+
+```go
+proxy.Gate{
+	Name: "vendor-a",
+	Addr: "http://gate.vendor-a.example:8000",       // or socks5://
+	User: `acct-4471{{with .Country}}-country-{{.}}{{end}}{{with .Session}}-sid-{{.}}{{end}}`,
+	Pass: kms.Must("proxy/vendor-a"),
+}.Exit()
+```
+
 The username is a `text/template` over the need, which is what lets one driver
-speak every dialect — including the conditional parts. A field the caller left
-empty takes its whole segment with it, because a provider reads a bare
-`country-` as an error rather than a wildcard. Take the exact field names from
-the provider's own docs; the mechanism does not care what they are.
+speak every dialect including the conditional parts. A field the caller left
+empty takes its whole segment with it, because a vendor reads a bare `country-`
+as an error rather than a wildcard. `Exit()` compiles the template, so a typo
+surfaces at load instead of under traffic.
 
 Both upstream transports are here: HTTP `CONNECT` and SOCKS5 with
-username/password auth. Several vendors offer SOCKS only, and it is the one way
-to carry something that is not HTTP.
+username/password auth. Several vendors are SOCKS-only, and it is the one way to
+carry something that is not HTTP.
 
-Passwords come from KMS at load. They are never logged, never returned in an
-error, and never visible to a caller.
+Passwords come from KMS at load. Never logged, never returned in an error, never
+visible to a caller.
+
+## The fence
+
+```go
+proxy.Fence(proxy.Public)
+```
+
+A guest names a URL, which is the job — but a URL can name `10.0.0.144:6443`, or
+the metadata address that hands out credentials. `Public` refuses loopback,
+private, link-local, carrier NAT, and names that only resolve through a
+cluster's search domains.
+
+It is a `Rule`, so one of them covers a whole route and an exit added later
+cannot miss it. It checks what was ASKED for rather than what the name resolves
+to: resolving here would leak every target to our own resolver and answer the
+wrong question, since the exit resolves from where the exit stands.
+
+`proxy.Anywhere` places no fence. Naming it is the point — there is no flag that
+quietly does this.
 
 ## Point anything at it
 
-`CONNECT` is the one interface every client already speaks, so nothing has to
-be taught about us. The need rides in the proxy username and the token in the
+`CONNECT` is the one interface every client already speaks, so nothing has to be
+taught about us. The need rides in the proxy username and the token in the
 password, which makes the whole configuration a URL:
 
 ```
@@ -84,40 +123,21 @@ Fields name themselves and order does not matter — `de`, `mobile.br`,
 `s-cart42`. An unknown field is refused rather than ignored, because silently
 dropping one serves traffic from the wrong country and looks like it worked.
 
-```bash
-curl -x 'http://de.residential:$TOKEN@proxy.hanzo.ai:8080' https://example.com
-```
-
-Plain proxied `GET` is deliberately not served. It would put this in the middle
-of unencrypted requests carrying the caller's own cookies, to read or to log by
-accident. `CONNECT` keeps the payload end to end and leaves us the one thing we
-need: the host.
-
-Authentication is a function, so this package carries no identity provider:
-
 ```go
-&proxy.Server{Proxy: p, Check: iam.Verify}
+&proxy.Server{Exit: route, Check: iam.Verify}
 ```
 
-## Choosing
-
-Every upstream that could serve the need is tried before giving up — the caller
-asked for a property of the exit, not for a company. A vendor that just failed
-sorts last rather than being removed, because the alternative to a degraded
-exit is usually no exit.
-
-A sticky session pins to one vendor by hash, and health does not override it.
-Rotating a pinned session would hand the caller a different address mid-flow,
-which is the one thing the session was asked for.
-
-`ErrNoExit` is distinct from a dial failure on purpose. One is a gap in the
-table that an operator fixes; the other is a bad minute that retrying fixes.
+Authentication is a function, so this package carries no identity provider.
+Plain proxied `GET` is deliberately not served: it would put this in the middle
+of unencrypted requests carrying the caller's own cookies. `CONNECT` keeps the
+payload end to end and leaves us the one thing we need — the host.
 
 ## Both hosts
 
 The same capability fits both ways we run untrusted code. A WASM guest reaches
-it through a host function. A Visor container reaches it through the `CONNECT`
-listener, with no other route off the box.
+it through a host function; a Visor container through the `CONNECT` listener,
+with no other route off the box. `proxy.Client(route, need)` hands either one an
+ordinary `*http.Client`.
 
 ```
 go test -race ./...

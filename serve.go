@@ -23,7 +23,10 @@ import (
 // Fields are self-describing and order does not matter: a two-letter code is a
 // country, a kind names itself, and s-<id> pins a session.
 type Server struct {
-	Proxy *Proxy
+	// Exit is whatever the deployment composed — one gate, or a fenced,
+	// health-ordered, session-pinned route over a dozen. This type cannot tell
+	// and does not need to.
+	Exit Exit
 	// Check authenticates a caller. It is a function rather than a dependency
 	// so this package stays free of an identity provider; the cloud passes
 	// IAM, and there is no second way to be allowed in.
@@ -77,7 +80,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		addr = net.JoinHostPort(addr, "443")
 	}
 
-	up, err := s.Proxy.Dial(r.Context(), need, addr)
+	up, err := s.Exit(r.Context(), need, addr)
 	if err != nil {
 		code := http.StatusBadGateway
 		if errors.Is(err, ErrNoExit) {

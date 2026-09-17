@@ -1,19 +1,8 @@
 // Package proxy gives an agent the web without giving it the network.
 //
-// Research, scraping and browsing all need to reach the internet from a place
-// that is not obviously a datacenter, often from a named country, and often
-// from the SAME address twice in a row. The usual way to arrange that is to
-// hand the workload a provider's credentials and let it dial out. That is the
-// thing to avoid: credentials in a sandbox are credentials you have published,
-// and a workload that can open a socket can open any socket.
-//
-// So the sandbox gets no network at all, and this is the network. A caller
-// says what it needs of an exit — country, kind, and whether to stay put — and
-// gets a connection. It never learns which provider served it, never holds a
-// provider password, and cannot address anything but the host it asked for.
-//
-// The same capability fits both execution hosts: a WASM guest reaches it
-// through a host function, a Visor container through this CONNECT listener.
+// A caller says what it needs of an exit — country, kind, whether to stay put —
+// and gets a connection. It never learns which vendor served it, never holds a
+// vendor password, and cannot address anything but the host it asked for.
 package proxy
 
 import (
@@ -24,18 +13,27 @@ import (
 	"net"
 	"net/http"
 	"sort"
-	"strings"
 	"sync/atomic"
-	"text/template"
 	"time"
 )
 
-// Kind is how an exit reaches the internet.
-//
-// It is the axis callers actually care about, because it decides who lets you
-// in: a datacenter address is fast, cheap and refused by anything with a bot
-// policy; a mobile address shares a carrier NAT with thousands of real phones
-// and is refused by almost nothing, at several times the price.
+// Need is what a caller requires of an exit. The zero Need means "anywhere that
+// works", which is the right ask for most single fetches.
+type Need struct {
+	// Country is ISO 3166-1 alpha-2, lowercase. Empty means any.
+	Country string
+	Kind    Kind
+	// Session ties a run of requests to one address. A login and the page
+	// behind it have to arrive from the same place or the site sees two
+	// visitors; empty lets every request take a fresh address, which is what
+	// breadth-first crawling wants. Opaque, and never logged.
+	Session string
+}
+
+// Kind is how an exit reaches the internet — the axis that decides who lets you
+// in. A datacenter address is fast, cheap and refused by anything with a bot
+// policy; a mobile one shares a carrier NAT with thousands of real phones and is
+// refused by almost nothing, at several times the price.
 type Kind uint8
 
 const (
@@ -45,82 +43,61 @@ const (
 	Mobile
 )
 
-var kinds = map[string]Kind{
-	"any": Any, "datacenter": Datacenter, "residential": Residential, "mobile": Mobile,
+// Exit reaches addr through somewhere that satisfies n.
+//
+// This is the whole interface, and everything else in the package is a function
+// that returns one. A vendor, our own egress, a test double, and the composition
+// of a dozen of them are all this same type — so there is nothing to implement,
+// nothing to register, and no struct whose fields decide what a caller may
+// compose. What used to be a Pool's fields are now separate functions that each
+// answer one question.
+type Exit func(ctx context.Context, n Need, addr string) (net.Conn, error)
+
+// Rule transforms an Exit. Fencing and capability are each one of these, so a
+// deployment states what it wants by composing rather than by filling in a
+// struct somebody else designed.
+type Rule func(Exit) Exit
+
+// Chain composes, left to right: Chain(f, g)(x) is g(f(x)).
+//
+// Generic because composing endomorphisms is not a fact about proxies, and a
+// second copy of it for the next function type would be the same five lines
+// with one word changed.
+func Chain[T any](fs ...func(T) T) func(T) T {
+	return func(x T) T {
+		for _, f := range fs {
+			x = f(x)
+		}
+		return x
+	}
 }
 
-func (k Kind) String() string {
-	for s, v := range kinds {
-		if v == k {
-			return s
+// ErrNoExit means nothing can serve the need. It is distinct from a dial failure
+// on purpose: one is a gap an operator fixes, the other is a bad minute that
+// retrying fixes.
+var ErrNoExit = errors.New("no exit serves that need")
+
+// Only refuses needs an exit cannot serve, so capability is a rule rather than
+// two more fields every exit has to carry whether or not it constrains anything.
+func Only(can func(Need) bool) Rule {
+	return func(e Exit) Exit {
+		return func(ctx context.Context, n Need, addr string) (net.Conn, error) {
+			if !can(n) {
+				return nil, fmt.Errorf("%w: %+v", ErrNoExit, n)
+			}
+			return e(ctx, n, addr)
 		}
 	}
-	return "any"
 }
 
-// Need is what a caller requires of an exit. The zero Need means "anywhere
-// that works", which is the right ask for most single fetches.
-type Need struct {
-	// Country is ISO 3166-1 alpha-2, lowercase. Empty means any.
-	Country string
-	Kind    Kind
-	// Session ties a run of requests to one address. A login and the page
-	// behind it have to arrive from the same place or the site sees two
-	// visitors and shows neither the content; an empty Session lets every
-	// request take a fresh address, which is what breadth-first crawling
-	// wants. The string is opaque and is never logged.
-	Session string
-}
-
-// Pool is one upstream that supplies exits.
-//
-// There is one implementation because the market has one shape. NodeMaven,
-// ProxyEmpire, Bright Data, Oxylabs, Smartproxy and IPRoyal all present a
-// single gateway address and carry the routing in the USERNAME; they differ
-// only in the words they spell it with. So a provider here is a table row, not
-// a driver, and supporting the next one is config.
-type Pool struct {
-	// Label names the upstream in metrics and errors. It is not a secret and
-	// is never shown to a caller, who has no business knowing who served them.
-	Label string
-	// Addr is scheme://host:port, scheme http or socks5.
-	Addr string
-	// User is a text/template over Need, which is what lets one driver speak
-	// every provider's dialect including the conditional parts:
-	//
-	//	acct-4471{{with .Country}}-country-{{.}}{{end}}{{with .Session}}-sid-{{.}}{{end}}
-	//
-	// A field the caller left empty drops its whole segment, because sending
-	// a provider a bare "country-" is an error, not a wildcard.
-	User string
-	// Pass is resolved from KMS when the table is loaded. It is never written
-	// to a log, an error, or a caller-visible surface.
-	Pass string
-	// Kinds this upstream can serve; empty means every kind.
-	Kinds []Kind
-	// Countries it can serve, ISO 3166-1 alpha-2 lowercase; empty means every.
-	Countries []string
-	// Zones translates a Kind into the provider's own word for it, for
-	// templates that name the kind.
-	Zones map[Kind]string
-
-	tmpl *template.Template
-	// fails counts consecutive failures. It orders selection and nothing
-	// else: a provider having a bad minute should be tried last, not removed,
-	// because the alternative to a degraded exit is usually no exit.
-	fails atomic.Int64
-}
-
-// Serves reports whether this upstream can answer the need at all. It is a
-// filter on what was configured, not a promise the dial will work.
-func (p *Pool) Serves(n Need) bool {
-	if n.Kind != Any && len(p.Kinds) > 0 && !has(p.Kinds, n.Kind) {
-		return false
+// In is the predicate for a fixed set of countries and kinds; empty means any.
+func In(countries []string, kinds []Kind) func(Need) bool {
+	return func(n Need) bool {
+		if n.Kind != Any && len(kinds) > 0 && !has(kinds, n.Kind) {
+			return false
+		}
+		return n.Country == "" || len(countries) == 0 || has(countries, n.Country)
 	}
-	if n.Country != "" && len(p.Countries) > 0 && !has(p.Countries, n.Country) {
-		return false
-	}
-	return true
 }
 
 func has[T comparable](xs []T, x T) bool {
@@ -132,133 +109,127 @@ func has[T comparable](xs []T, x T) bool {
 	return false
 }
 
-// name renders the upstream username for this need.
-func (p *Pool) name(n Need) (string, error) {
-	if p.tmpl == nil {
-		return p.User, nil
+// Order decides which exits to try, and in what order, for one need.
+type Order func(Need, []Exit) []Exit
+
+// Try returns an Exit that walks the others in the order's order until one
+// answers. Trying and ordering are separate because every ordering below shares
+// the same walk, and the walk has the only part worth getting right: a caller
+// that went away ends the attempt, and a gap in the table reads differently from
+// a bad minute.
+func Try(order Order, exits ...Exit) Exit {
+	return func(ctx context.Context, n Need, addr string) (net.Conn, error) {
+		try := order(n, exits)
+		if len(try) == 0 {
+			return nil, fmt.Errorf("%w: %+v", ErrNoExit, n)
+		}
+		var errs []error
+		for _, e := range try {
+			c, err := e(ctx, n, addr)
+			if err == nil {
+				return c, nil
+			}
+			errs = append(errs, err)
+			if ctx.Err() != nil {
+				break
+			}
+		}
+		return nil, errors.Join(errs...)
 	}
-	zone := p.Zones[n.Kind]
-	if zone == "" {
-		zone = n.Kind.String()
-	}
-	var b strings.Builder
-	err := p.tmpl.Execute(&b, struct {
-		Country, Kind, Session string
-	}{n.Country, zone, n.Session})
-	return b.String(), err
 }
 
-// Proxy composes upstreams and chooses between them.
-type Proxy struct {
-	// Reach fences what a caller may address. Nil means Public, which is the
-	// web and nothing of ours; see Anywhere to say otherwise out loud.
-	Reach Reach
+// Fixed keeps the order it was given.
+func Fixed(_ Need, es []Exit) []Exit { return es }
 
-	pools []*Pool
-	seed  maphash.Seed
+// Pin sends a session to the same exit every time, by hash. What a sticky
+// session asks for IS one address, so no other ordering may override it.
+func Pin(seed maphash.Seed) Order {
+	return func(n Need, es []Exit) []Exit {
+		if n.Session == "" || len(es) < 2 {
+			return es
+		}
+		i := int(maphash.String(seed, n.Session) % uint64(len(es)))
+		out := append([]Exit(nil), es...)
+		out[0], out[i] = out[i], out[0]
+		return out
+	}
 }
 
-// negotiate bounds a handshake when the caller named no deadline of its own.
-// A proxy that answers at all answers quickly; one that does not must still
-// give the socket back.
+// Health orders by consecutive failures, fewest first, and returns the Order
+// together with the Rule that feeds it. They are returned as a pair because
+// health is one fact observed in two places — counted where a dial fails, read
+// where the next dial is ordered — and handing back only the Order would leave
+// a caller to wire the counting by hand and silently get it wrong.
+func Health() (Order, Rule) {
+	var n atomic.Int64 // index handed to the next Watch call
+	var fails []*atomic.Int64
+	rank := map[int]*atomic.Int64{}
+
+	watch := func(e Exit) Exit {
+		i := int(n.Add(1) - 1)
+		c := &atomic.Int64{}
+		fails = append(fails, c)
+		rank[i] = c
+		return func(ctx context.Context, need Need, addr string) (net.Conn, error) {
+			conn, err := e(ctx, need, addr)
+			if err != nil {
+				c.Add(1)
+			} else {
+				c.Store(0)
+			}
+			return conn, err
+		}
+	}
+	order := func(_ Need, es []Exit) []Exit {
+		if len(es) < 2 || len(fails) < len(es) {
+			return es
+		}
+		idx := make([]int, len(es))
+		for i := range idx {
+			idx[i] = i
+		}
+		sort.SliceStable(idx, func(a, b int) bool {
+			return fails[idx[a]].Load() < fails[idx[b]].Load()
+		})
+		out := make([]Exit, len(es))
+		for i, j := range idx {
+			out[i] = es[j]
+		}
+		return out
+	}
+	return order, watch
+}
+
+// Then runs orders in sequence, so a pin can survive a health sort: the last
+// order wins the first position, which is why Pin belongs last.
+func Then(os ...Order) Order {
+	return func(n Need, es []Exit) []Exit {
+		for _, o := range os {
+			es = o(n, es)
+		}
+		return es
+	}
+}
+
+// negotiate bounds a handshake when the caller named no deadline of its own. A
+// proxy that answers at all answers quickly; one that does not must still give
+// the socket back.
 const negotiate = 30 * time.Second
 
-// ErrNoExit means nothing configured can serve the need. It is distinct from a
-// dial failure on purpose: one is a gap in the table that an operator fixes,
-// the other is a bad minute that retrying fixes.
-var ErrNoExit = errors.New("no exit serves that need")
-
-// New compiles the table. It fails on a bad username template rather than at
-// the first dial, so a typo surfaces at load instead of under traffic.
-func New(pools ...*Pool) (*Proxy, error) {
-	for _, p := range pools {
-		if p.Addr == "" {
-			return nil, fmt.Errorf("pool %q: no address", p.Label)
-		}
-		t, err := template.New(p.Label).Parse(p.User)
-		if err != nil {
-			return nil, fmt.Errorf("pool %q: user template: %w", p.Label, err)
-		}
-		p.tmpl = t
-	}
-	return &Proxy{pools: pools, seed: maphash.MakeSeed()}, nil
-}
-
-// Dial opens a connection to addr through an exit that satisfies n.
+// Client returns an http.Client whose every request leaves through e satisfying
+// n.
 //
-// It tries every upstream that could serve the need before giving up, because
-// a caller asked for a property of the exit and does not care which vendor
-// provides it — that is the whole point of the indirection.
-func (x *Proxy) Dial(ctx context.Context, n Need, addr string) (net.Conn, error) {
-	// Before anything is dialled, and for every path in: the CONNECT listener,
-	// a WASM guest's fetch, a container's egress. One fence, checked once,
-	// where every route already converges.
-	reach := x.Reach
-	if reach == nil {
-		reach = Public
-	}
-	if err := reach(addr); err != nil {
-		return nil, err
-	}
-	order := x.order(n)
-	if len(order) == 0 {
-		return nil, fmt.Errorf("%w: %+v", ErrNoExit, n)
-	}
-	var errs []error
-	for _, p := range order {
-		c, err := p.dial(ctx, n, addr)
-		if err == nil {
-			p.fails.Store(0)
-			return c, nil
-		}
-		p.fails.Add(1)
-		errs = append(errs, fmt.Errorf("%s: %w", p.Label, err))
-		if ctx.Err() != nil {
-			break
-		}
-	}
-	return nil, errors.Join(errs...)
-}
-
-// order returns the upstreams that can serve n, best first.
-//
-// A sticky session pins to one upstream by hashing the session, so the same
-// run keeps landing on the same vendor and therefore the same address — that
-// is what the caller asked for and no amount of health-based reordering may
-// override it. Everything else sorts by consecutive failures.
-func (x *Proxy) order(n Need) []*Pool {
-	var fit []*Pool
-	for _, p := range x.pools {
-		if p.Serves(n) {
-			fit = append(fit, p)
-		}
-	}
-	if len(fit) < 2 {
-		return fit
-	}
-	if n.Session != "" {
-		i := int(maphash.String(x.seed, n.Session) % uint64(len(fit)))
-		fit[0], fit[i] = fit[i], fit[0]
-		return fit
-	}
-	sort.SliceStable(fit, func(a, b int) bool { return fit[a].fails.Load() < fit[b].fails.Load() })
-	return fit
-}
-
-// Client returns an http.Client whose every request leaves through an exit
-// satisfying n.
-//
-// This is how the rest of the platform holds a proxy: a WASM guest's fetch
+// This is how the rest of the platform holds a route: a WASM guest's fetch
 // capability and an ordinary Go caller are the same client, so nothing has to
 // learn a second way to make a request.
-func (x *Proxy) Client(n Need) *http.Client {
+func Client(e Exit, n Need) *http.Client {
 	return &http.Client{Transport: &http.Transport{
 		DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
-			return x.Dial(ctx, n, addr)
+			return e(ctx, n, addr)
 		},
 		// The tunnel is per-exit, and a pooled connection is an exit already
-		// chosen. Reusing one across a rotating need would silently pin what
-		// the caller asked to rotate.
+		// chosen. Reusing one across a rotating need would silently pin what the
+		// caller asked to rotate.
 		DisableKeepAlives: n.Session == "",
 		ForceAttemptHTTP2: true,
 	}}
