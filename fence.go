@@ -1,0 +1,80 @@
+package proxy
+
+import (
+	"errors"
+	"fmt"
+	"net"
+	"net/netip"
+	"strings"
+)
+
+// ErrClosed means the target is inside the fence rather than out on the web.
+//
+// This is the difference between an agentic scraping platform and a way into
+// our own cluster. A guest names a URL, which is the job — but a URL can name
+// 10.0.0.144:6443, or the cloud metadata address that hands out credentials,
+// or a Kubernetes service that is only reachable from inside. None of those are
+// the web, and a proxy that dials them is a hole with an HTTP interface.
+var ErrClosed = errors.New("destination is not public")
+
+// cgnat is carrier-grade NAT, which netip does not count as private and which
+// is where a good deal of private infrastructure actually lives.
+var cgnat = netip.MustParsePrefix("100.64.0.0/10")
+
+// inside names that can only resolve to something of ours. A single-label name
+// is included because it resolves through the resolver's search domains, which
+// on a cluster node means straight into the cluster.
+var inside = []string{".local", ".internal", ".localdomain", ".svc", ".cluster.local", ".arpa"}
+
+// Reach decides which destinations count as the web. A Proxy with none uses
+// Public, so the safe answer is what you get for not having an opinion.
+type Reach func(addr string) error
+
+// Anywhere places no fence. It is for a test dialling its own loopback origin,
+// and for a deployment whose exits are all its own. Naming it is the point:
+// there is no flag that quietly does this, so removing the fence is a decision
+// that appears in the code that made it.
+func Anywhere(string) error { return nil }
+
+// Public reports whether addr is somewhere out on the web.
+//
+// It is deliberately a check on what was ASKED for rather than on what the name
+// resolves to. Resolving here would be worse on both counts: it leaks every
+// target to our own resolver, and the answer is not the one that matters —
+// the exit resolves the name from where the exit stands, not from here.
+func Public(addr string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("%w: %q is not host:port", ErrClosed, addr)
+	}
+	a, err := netip.ParseAddr(strings.Trim(host, "[]"))
+	if err != nil {
+		return publicName(host)
+	}
+	a = a.Unmap()
+	switch {
+	case a.IsLoopback(), a.IsPrivate(), a.IsUnspecified(), a.IsMulticast(),
+		a.IsLinkLocalUnicast(), a.IsLinkLocalMulticast(), a.IsInterfaceLocalMulticast(),
+		cgnat.Contains(a):
+		return fmt.Errorf("%w: %s", ErrClosed, a)
+	}
+	return nil
+}
+
+func publicName(host string) error {
+	h := strings.ToLower(strings.TrimSuffix(host, "."))
+	if h == "" {
+		return fmt.Errorf("%w: empty host", ErrClosed)
+	}
+	if !strings.Contains(h, ".") {
+		// Resolved through search domains, so on a cluster node this is a
+		// service name, not a site.
+		return fmt.Errorf("%w: %q has no public suffix", ErrClosed, host)
+	}
+	for _, s := range inside {
+		if strings.HasSuffix(h, s) {
+			return fmt.Errorf("%w: %q", ErrClosed, host)
+		}
+	}
+	return nil
+}

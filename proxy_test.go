@@ -213,6 +213,9 @@ func mustNew(t *testing.T, pools ...*Pool) *Proxy {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// These tests dial an origin they started on loopback, which the default
+	// fence refuses and is right to. TestFence covers the fence itself.
+	x.Reach = Anywhere
 	return x
 }
 

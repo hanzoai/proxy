@@ -115,7 +115,9 @@ func TestPlainGetIsRefused(t *testing.T) {
 // A need nothing serves must not read as a transient upstream failure.
 func TestUnservableNeedIsNotABadGateway(t *testing.T) {
 	s := &Server{Proxy: mustNew(t, &Pool{Label: "dc", Addr: "http://127.0.0.1:1", Kinds: []Kind{Datacenter}})}
-	r := httptest.NewRequest("CONNECT", "//example.com:443", nil)
+	// Authority-form, as net/http hands a real CONNECT to a handler.
+	r := httptest.NewRequest("CONNECT", "/", nil)
+	r.URL = &url.URL{Host: "example.com:443"}
 	r.Header.Set("Proxy-Authorization", basic("mobile", "t"))
 	w := httptest.NewRecorder()
 	s.ServeHTTP(w, r)

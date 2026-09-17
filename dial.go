@@ -33,9 +33,19 @@ func (p *Pool) dial(ctx context.Context, n Need, addr string) (net.Conn, error) 
 	if err != nil {
 		return nil, err
 	}
-	if t, ok := ctx.Deadline(); ok {
-		_ = c.SetDeadline(t)
+
+	// Negotiation is bounded two ways, because one is not enough. A DEADLINE
+	// stops a handshake that stalls, and the caller's is used when it named
+	// one. CANCELLATION is the other, and a net.Conn does not watch a context:
+	// the only thing that unblocks a blocked read is closing it, so that is
+	// what cancellation is wired to.
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(negotiate)
 	}
+	_ = c.SetDeadline(deadline)
+	stop := context.AfterFunc(ctx, func() { c.Close() })
+
 	switch scheme {
 	case "http", "https":
 		err = connect(c, addr, user, p.Pass)
@@ -44,13 +54,24 @@ func (p *Pool) dial(ctx context.Context, n Need, addr string) (net.Conn, error) 
 	default:
 		err = fmt.Errorf("unknown scheme %q", scheme)
 	}
+
+	// Unwire before the conn is handed back. A false return means cancellation
+	// already ran and this socket is closed or closing, so there is nothing to
+	// return but the reason — and reporting the handshake error instead would
+	// blame the upstream for our own caller going away.
+	if !stop() {
+		c.Close()
+		return nil, context.Cause(ctx)
+	}
 	if err != nil {
 		c.Close()
 		return nil, err
 	}
-	// The deadline covered NEGOTIATION. Leaving it on would cap the tunnel's
-	// whole life at the dial timeout, which for a long page fetch is a read
-	// error that looks like the site hung up.
+	// Past here the conn belongs to the caller and not to ctx, which is exactly
+	// what net.Dialer.DialContext promises about the one it returns. The
+	// deadline goes with it: it covered NEGOTIATION, and leaving it on would
+	// cap the tunnel's whole life at the handshake timeout — for a long page
+	// fetch, a read error that looks like the site hung up.
 	_ = c.SetDeadline(time.Time{})
 	return c, nil
 }

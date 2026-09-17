@@ -22,10 +22,12 @@ import (
 	"fmt"
 	"hash/maphash"
 	"net"
+	"net/http"
 	"sort"
 	"strings"
 	"sync/atomic"
 	"text/template"
+	"time"
 )
 
 // Kind is how an exit reaches the internet.
@@ -148,9 +150,18 @@ func (p *Pool) name(n Need) (string, error) {
 
 // Proxy composes upstreams and chooses between them.
 type Proxy struct {
+	// Reach fences what a caller may address. Nil means Public, which is the
+	// web and nothing of ours; see Anywhere to say otherwise out loud.
+	Reach Reach
+
 	pools []*Pool
 	seed  maphash.Seed
 }
+
+// negotiate bounds a handshake when the caller named no deadline of its own.
+// A proxy that answers at all answers quickly; one that does not must still
+// give the socket back.
+const negotiate = 30 * time.Second
 
 // ErrNoExit means nothing configured can serve the need. It is distinct from a
 // dial failure on purpose: one is a gap in the table that an operator fixes,
@@ -179,6 +190,16 @@ func New(pools ...*Pool) (*Proxy, error) {
 // a caller asked for a property of the exit and does not care which vendor
 // provides it — that is the whole point of the indirection.
 func (x *Proxy) Dial(ctx context.Context, n Need, addr string) (net.Conn, error) {
+	// Before anything is dialled, and for every path in: the CONNECT listener,
+	// a WASM guest's fetch, a container's egress. One fence, checked once,
+	// where every route already converges.
+	reach := x.Reach
+	if reach == nil {
+		reach = Public
+	}
+	if err := reach(addr); err != nil {
+		return nil, err
+	}
 	order := x.order(n)
 	if len(order) == 0 {
 		return nil, fmt.Errorf("%w: %+v", ErrNoExit, n)
@@ -222,4 +243,23 @@ func (x *Proxy) order(n Need) []*Pool {
 	}
 	sort.SliceStable(fit, func(a, b int) bool { return fit[a].fails.Load() < fit[b].fails.Load() })
 	return fit
+}
+
+// Client returns an http.Client whose every request leaves through an exit
+// satisfying n.
+//
+// This is how the rest of the platform holds a proxy: a WASM guest's fetch
+// capability and an ordinary Go caller are the same client, so nothing has to
+// learn a second way to make a request.
+func (x *Proxy) Client(n Need) *http.Client {
+	return &http.Client{Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+			return x.Dial(ctx, n, addr)
+		},
+		// The tunnel is per-exit, and a pooled connection is an exit already
+		// chosen. Reusing one across a rotating need would silently pin what
+		// the caller asked to rotate.
+		DisableKeepAlives: n.Session == "",
+		ForceAttemptHTTP2: true,
+	}}
 }
