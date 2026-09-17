@@ -41,15 +41,15 @@ type Order func(Need, []Exit) []Exit   // health, pinning
 ```
 
 Capability, health, fencing and failover used to be fields on a struct and
-branches inside one Dial. They are independent, so they are separate:
+branches inside one `Dial`. They are independent, so they are separate:
 
 ```go
 order, watch := proxy.Health()
 
-route := proxy.Chain(proxy.Fence(proxy.Public))(
+route := proxy.Fence(proxy.Public)(
 	proxy.Try(proxy.Then(order, proxy.Pin(seed)),
-		watch(mustExit(vendorA)),
-		watch(proxy.Only(proxy.In([]string{"de", "fr"}, nil))(mustExit(vendorB))),
+		watch(vendorA),
+		watch(proxy.Only(proxy.In([]string{"de", "fr"}, nil))(vendorB)),
 	),
 )
 ```
@@ -59,8 +59,22 @@ the set is ordered by health and then pinned by session, and the whole route is
 fenced. Adding a vendor is one more line; adding a policy is one more `Rule`,
 and nothing it wraps has to know.
 
+A `Rule` is an ordinary function, so one of them applies by calling it.
+`Chain` is for two or more:
+
+```go
+proxy.Chain(proxy.Fence(proxy.Public), metrics, audit)(route)
+```
+
 `Then` runs orders in sequence and the last one wins first position, which is
 why a pin belongs after a health sort rather than before it.
+
+`Health` returns its `Order` and the `Rule` that feeds it together, because it
+is one fact observed in two places. The exits given to `Try` must be the values
+`watch` returned, in that order — the form above guarantees it, since Go
+evaluates call arguments left to right. Split them across statements and
+reorder them and ordering degrades to the order it was given rather than
+ranking the wrong exits.
 
 ## Vendors are a table, not a driver
 

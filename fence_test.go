@@ -84,7 +84,7 @@ func TestFenceRefusesBeforeDialling(t *testing.T) {
 // miss it. That is the reason it is a Rule and not a field on each exit.
 func TestFenceCoversEveryExitInTheRoute(t *testing.T) {
 	a, b := serveUp(t, false), serveUp(t, false)
-	route := Chain(Fence(Public))(Try(Fixed,
+	route := Fence(Public)(Try(Fixed,
 		exit(t, Gate{Name: "a", Addr: a.addr()}),
 		exit(t, Gate{Name: "b", Addr: b.addr()}),
 	))
@@ -101,7 +101,7 @@ func TestFenceCoversEveryExitInTheRoute(t *testing.T) {
 // negotiation deadline instead of returning.
 func TestCancelDuringHandshake(t *testing.T) {
 	ln := stalled(t)
-	e := Chain(Fence(Anywhere))(exit(t, Gate{Name: "stalled", Addr: "http://" + ln}))
+	e := Fence(Anywhere)(exit(t, Gate{Name: "stalled", Addr: "http://" + ln}))
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() { time.Sleep(50 * time.Millisecond); cancel() }()
 
@@ -117,7 +117,7 @@ func TestCancelDuringHandshake(t *testing.T) {
 // And a deadline is still honoured when the caller names one.
 func TestHandshakeDeadline(t *testing.T) {
 	ln := stalled(t)
-	e := Chain(Fence(Anywhere))(exit(t, Gate{Name: "stalled", Addr: "http://" + ln}))
+	e := Fence(Anywhere)(exit(t, Gate{Name: "stalled", Addr: "http://" + ln}))
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	if _, err := e(ctx, Need{}, "example.com:443"); err == nil {

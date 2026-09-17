@@ -6,13 +6,15 @@
 package proxy
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"hash/maphash"
 	"net"
 	"net/http"
-	"sort"
+	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -155,41 +157,62 @@ func Pin(seed maphash.Seed) Order {
 	}
 }
 
-// Health orders by consecutive failures, fewest first, and returns the Order
-// together with the Rule that feeds it. They are returned as a pair because
-// health is one fact observed in two places — counted where a dial fails, read
-// where the next dial is ordered — and handing back only the Order would leave
-// a caller to wire the counting by hand and silently get it wrong.
+// Health counts consecutive failures and orders by them, fewest first.
+//
+// The Order and the Rule come back as a pair because health is ONE fact
+// observed in two places — counted where a dial fails, read where the next dial
+// is ordered. Handing back only the Order would leave a caller to wire the
+// counting by hand and silently get it wrong.
+//
+// The exits given to Try must be the values Watch returned, in that order. The
+// natural form guarantees it, because Go evaluates call arguments left to
+// right:
+//
+//	order, watch := proxy.Health()
+//	route := proxy.Try(order, watch(a), watch(b), watch(c))
+//
+// Split those across statements and reorder them and the counts follow the
+// registration, not the exits. Ordering then degrades to the order it was
+// given rather than ranking the wrong exits — a mixed set (some watched, some
+// not) does the same. Silent, and deliberately so: a demoted vendor is a
+// preference, and getting a preference wrong is not worth failing a request
+// that would otherwise have been served.
 func Health() (Order, Rule) {
-	var n atomic.Int64 // index handed to the next Watch call
+	var mu sync.Mutex
 	var fails []*atomic.Int64
-	rank := map[int]*atomic.Int64{}
 
 	watch := func(e Exit) Exit {
-		i := int(n.Add(1) - 1)
 		c := &atomic.Int64{}
+		mu.Lock()
 		fails = append(fails, c)
-		rank[i] = c
+		mu.Unlock()
 		return func(ctx context.Context, need Need, addr string) (net.Conn, error) {
 			conn, err := e(ctx, need, addr)
 			if err != nil {
 				c.Add(1)
 			} else {
+				// Recovered. Consecutive, not cumulative: a vendor that had a
+				// bad minute an hour ago should not be behind one that is
+				// failing now.
 				c.Store(0)
 			}
 			return conn, err
 		}
 	}
+
 	order := func(_ Need, es []Exit) []Exit {
-		if len(es) < 2 || len(fails) < len(es) {
+		mu.Lock()
+		known := fails[:min(len(fails), len(es))]
+		mu.Unlock()
+		if len(es) < 2 || len(known) < len(es) {
 			return es
 		}
 		idx := make([]int, len(es))
 		for i := range idx {
 			idx[i] = i
 		}
-		sort.SliceStable(idx, func(a, b int) bool {
-			return fails[idx[a]].Load() < fails[idx[b]].Load()
+		slices.SortStableFunc(idx, func(a, b int) int {
+			return cmp.Compare(known[a].Load(), known[b].Load())
 		})
 		out := make([]Exit, len(es))
 		for i, j := range idx {

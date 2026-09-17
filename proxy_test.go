@@ -227,7 +227,7 @@ func open(t *testing.T, gs ...Gate) Exit {
 	for i, g := range gs {
 		es[i] = exit(t, g)
 	}
-	return Chain(Fence(Anywhere))(Try(Fixed, es...))
+	return Fence(Anywhere)(Try(Fixed, es...))
 }
 
 // Both transports must carry a Need out to the vendor and return a tunnel that

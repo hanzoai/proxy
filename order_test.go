@@ -62,7 +62,7 @@ func TestPinIsStable(t *testing.T) {
 		return log[0]
 	}
 	first := lead()
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		if got := lead(); got != first {
 			t.Fatalf("a pinned session moved from %s to %s", first, got)
 		}
@@ -133,7 +133,7 @@ func TestThenLetsThePinWin(t *testing.T) {
 	// Whatever the pin chooses, it must be the same across calls even though
 	// health wants a different first.
 	got := combined(Need{Session: "s"}, es)
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		if len(combined(Need{Session: "s"}, es)) != len(got) {
 			t.Fatal("ordering changed shape between calls")
 		}
